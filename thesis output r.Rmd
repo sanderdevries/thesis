@@ -1,0 +1,442 @@
+---
+title: "thesis"
+author: "Sander de Vries"
+date: "4/25/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE)
+```
+This first chunk of R-code consists of all the functions that I have defined so far. Below I will provide the graphs that we have discussed this morning with some estimates as well and the same calculations for another cohort. 
+```{r}
+m.files <- list.files(path = "lifetables", full.names = FALSE)
+
+#prepare the data by making all numbers numeric 
+
+#install.packages("HMDHFDplus")
+library(HMDHFDplus)
+forceType <- function(z){
+  z <- z[-1,]
+  colnames(z) <- as.character(unlist(z[1,]))
+  z = z[-1, 1:10]
+  z$Age <- age2int(z$Age)
+  z$Year <- as.integer(as.character(z$Year))
+  for(i in 3: 10){
+    z[,i] <- as.numeric(as.character(z[,i]))
+  }
+  z
+}
+fdata <- forceType(read.delim(m.files[1], header = FALSE, sep = "", dec = "."))
+mdata <- forceType(read.delim(m.files[2], header = FALSE, sep = "", dec = "."))
+
+#merge male and female to obtain unisex data
+library(plyr)
+udata <- join(fdata, mdata, by = c("Year", "Age"))
+udata[,6] <- udata[,6] + udata[,14]
+udata <- udata[,1:10]
+
+#this function creates a cohort for a given dataset 'z', with people bornin 'year', of initial age 'yearMin' and maximum age 'yearMax'
+cohort <- function(z, year, yearMin, yearMax){
+  z <- z[ which(z$Year - z$Age == year), ]
+  z <- z[ which(z$Age > yearMin & z$Age < yearMax), ]
+  z
+}
+fcohort <- cohort(fdata, 1920, 54, 96)
+mcohort <- cohort(mdata, 1920, 54, 96)
+ucohort <- cohort(udata, 1920, 54, 96)
+#1885, 64, 110
+#1920, 54, 96
+
+
+#below the necessary functions are defined to compute the survival functions for both simple OU and jump OU processes
+alpha.OU <- function(p,t){
+  a <- p[1]
+  sigma <- abs(p[2])
+  (sigma^2/(2*a^2))*t - (sigma^2/a^3)*exp(a*t) + (sigma^2/(4*a^3))*exp(2*a*t) + (3*sigma^2)/(4*a^3) 
+}
+
+
+alpha.OU.jump <- function(p,t){
+  a <- p[1]
+  sigma <- p[2]
+  l <- p[3]
+  mu <- p[4]
+  (sigma^2/(2*a^2) + ((l*a)/(a - mu)))*t - (sigma^2/a^3)*exp(a*t) + (sigma^2/(4*a^3))*exp(2*a*t) + (3*sigma^2)/(4*a^3) + (l/(a - mu)) * log(1 - (mu/a) + (mu/a)*exp(a*t))
+}
+
+beta <- function(p, t){
+  a <- p[1]
+  (1/a) * (1-exp(a*t))
+}
+
+survival.OU <- function(p,t,z){
+  lambda <- -log(1- z$qx[1])
+  exp(alpha.OU(p,t) + beta(p, t)*lambda)
+}
+
+survival.OU.jump <- function(p,t,z){
+  lambda <- -log(1- z$qx[1])
+  exp(alpha.OU.jump(p,t) + beta(p, t)*lambda)
+}
+
+
+#computes the mean square error of the survival function
+MSE.OU <- function(p, z){
+  difference <- rep(NA, nrow(z) - 1)
+  tpx <- rep(NA, nrow(z) - 1)
+  for(i in 1: nrow(z) - 1){
+  tpx[i] <- z$lx[i+1]/z$lx[1]
+  diff <- (tpx[i] - survival.OU(p,i,z))^2
+  difference[i] <- diff
+  }
+  sum(difference)/length(difference)
+}
+
+MSE.OU.jump <- function(p,z){
+  difference <- rep(NA, nrow(z) - 1)
+  tpx <- rep(NA, nrow(z) - 1)
+  for(i in 1: nrow(z) - 1){
+    tpx[i] <- z$lx[i+1]/z$lx[1]
+    diff <- (tpx[i] -survival.OU.jump(p,i, z))^2
+    difference[i] <- diff
+  }
+  sum(difference)/length(difference)
+}
+
+
+#maximum likelihood estimator for alpha and sigma based on paper. Works very poor still. 
+maxlik <- function(z){
+  numerator <- rep(NA, nrow(z) - 1)
+  denomerator <- rep(NA, nrow(z) - 1)
+  sigma.hat <- rep(NA, nrow(z) - 1)
+  for(i in 1:nrow(z) - 1){
+    numerator[i] <- (z$mx[i+1]*z$mx[i])
+    denomerator[i] <- z$mx[i]^2
+  }
+  a.hat <- (sum(numerator)/sum(denomerator))/100
+  
+  for(i in 1:nrow(z) - 1){
+    sigma.hat[i] <- (z$mx[i+1] - z$mx[i]*exp(a.hat))^2
+  }
+  sigma.hat <- sum(sigma.hat)/(nrow(z) - 1)
+  
+  return(c(a.hat, sigma.hat))
+}
+
+
+#calibration of the parameters using the optim function and minimizing the MSE w.r.t the parameters to be estimated 
+calibration.OU <- function(p.OU, z){
+  p.OU <- round(maxlik(z), digits = 4)
+  m.MSE.OU <- optim(p.OU, MSE.OU, method = "BFGS",  z = z)
+  par.OU <- c(m.MSE.OU$par[1], abs(m.MSE.OU$par[2]))
+  return(par.OU)
+}
+
+calibration.OU.j <- function(p.OU.j, z){
+  p.OU.j <- c(round(maxlik(z), digits = 4), 0.001, 0.001)
+  m.MSE.OU.jump <- optim(p=p.OU.j, MSE.OU.jump, method = "BFGS", z= z)
+  par.OU.jump <- c( m.MSE.OU.jump$par[1], abs(m.MSE.OU.jump$par[2]), m.MSE.OU.jump$par[3], m.MSE.OU.jump$par[4])
+  return(par.OU.jump)
+}
+
+#observed survival probabilities
+tpx <- function(z){
+  tpx <- rep(NA, nrow(z) - 1)
+  for(i in 1: nrow(z) - 1){
+    tpx[i] <- z$lx[i+1]/z$lx[1]
+  }
+  return(tpx)
+}
+
+
+#computes estimated survival probabilities given the calibrated parameters
+estimated.density.OU <- function(z, p.OU = round(maxlik(z), digits = 4), t){
+ survival.OU(calibration.OU(p.OU,z), t, z)
+}
+
+estimated.density.OU.jump <- function(z, p.OU.j =c(round(maxlik(z), digits = 4), 0.001, 0.001) , t){
+  survival.OU.jump(calibration.OU.j(p.OU.j, z), t, z)
+}
+
+estimated.density.OU.ML <- function(z, t){
+  survival.OU(maxlik(z), t, z)
+}
+
+#Graphs the observed and estimated survival probabilities
+library(ggplot2)
+graphs <- function(z){
+  obser <- data.frame(cbind(tpx(z), 1:(nrow(z) - 1)))
+  x.grid <- seq(0,to=nrow(z) - 1,by=0.01)
+  dd <- data.frame(x.grid,x2 = estimated.density.OU(z, t = x.grid), x3 = estimated.density.OU.jump(z, t = x.grid), x4 = estimated.density.OU.ML(z, t= x.grid))
+  ggplot(z) + 
+  geom_line(data=dd,aes(x=x.grid,y=x2, colour = "OU")) + 
+  geom_line(data=dd,aes(x=x.grid,y=x3, colour = "OU Jump")) +
+  geom_line(data=dd,aes(x=x.grid,y=x4, colour = "OU ML")) +
+  geom_line(data=obser, aes(x = X2, y = X1, colour = "Observed")) + 
+  ylab("Survival probability") + xlab("Remaining lifetime") +
+  scale_colour_manual(values=c("red","blue", "green", "black"))
+}
+
+#defines the shocked survival probability density
+shockSurvival <- function(t, e, z){
+  estimated.density.OU(z=z, t =t)^(1+e)
+}
+
+#computes the estimated shocked mortality as a function of the shock e and using the graph, 
+#we can visualize the severity of the shock in order for the shocked mortality to be 15 percent higher after 1 year
+par.OU = calibration.OU(round(maxlik(z = fcohort), digits = 4), z = fcohort)
+x <- seq(0, to = 0.2, by = 0.001)
+est.mortality <- 1 - shockSurvival(x, t = 1, z = fcohort)
+SS <- data.frame(x, est.mortality, qs = (1+0.15)*(1-survival.OU(par.OU, t = 1, z = fcohort)))
+ggplot(SS) + 
+  geom_line(data = SS, aes(x = x, y = est.mortality))+
+  geom_line(data = SS, aes(x = x, y = qs )) #the intercept is somewhere around e = 0.15 for female data
+
+epsilon <- function(z){
+  shock <- function(epsilon, s, z){ 
+    ( 1- estimated.density.OU(z=z, t =1)^(1+epsilon) - (1 + s)*(1 - estimated.density.OU(z=z, t=1)))^2 #minimize (1-Sx(1)^(1+e) - (1+s)Qx)^2 wrt e
+  }
+  return(optimize(shock, interval= c(0,1), s = 0.15, z= z)$minimum)
+}
+
+#creates a graph of the shocked and regular survival function
+graphShock <- function(z){
+  e <- epsilon(z)
+  t <- seq(0, to = nrow(z) - 1, by = 0.01)
+  est.SS <- shockSurvival(t=t, e = e, z=z)
+  datashock <- data.frame(t, x1 = est.SS, Sxt =estimated.density.OU(z = z, t = t))
+  ggplot(datashock) + 
+    geom_line(aes(x=t,y=Sxt, colour = "without shock")) + 
+    geom_line(aes(x=t,y=x1, colour = "shock")) 
+}
+
+#n year term life insurance
+nya <- function(n, r=0.02, z){
+  units <- rep(NA, n)
+  par <- calibration.OU(round(maxlik(z), digits = 4), z)
+  for(i in 1:n){
+    units[i] <- 1/(1+r)^(i+1)*(survival.OU(z=z, t = i-1, p  = par) - survival.OU(z=z, t= i, p = par))
+  }
+  return(sum(units))
+}
+
+#shocked n-year term life insurance
+nyas <- function(n, r=0.02, z){
+  units <- rep(NA, n)
+  par <- calibration.OU(round(maxlik(z), digits = 4), z)
+  e <- epsilon(z)
+  for(i in 1:n){
+    units[i] <- 1/(1+r)^(i+1)*(survival.OU(z=z, t = i-1, p  = par)^(1+e) - survival.OU(z=z, t= i, p = par)^(1+e))
+  }
+  return(sum(units))
+}
+
+#SCR n year term life insurance
+SCRnya <- function(n, z){
+  nyas(n, z=z) - nya(n, z=z)
+}
+
+#n year endowment  
+nye <- function(n, r=0.02, z){
+  units <- rep(NA, n)
+  par <- calibration.OU(round(maxlik(z), digits =4 ), z)
+  for(i in 1:n){
+    units[i] <- 1/(1+r)^(i+1)*(survival.OU(par, z = z, t =i-1) - survival.OU(p = par, z=z, t=i)) 
+  }
+  return(sum(units) + 1/(1+r)^n*(survival.OU(par, z=z, t= n)))
+}
+
+#shocked n year  endowment 
+nyes <- function(n, r=0.02, z){
+  units <- rep(NA, n)
+  par <- calibration.OU(round(maxlik(z), digits =4 ), z)
+  e <- epsilon(z)
+  for(i in 1:n){
+    units[i] <- 1/(1+r)^(i+1)*(survival.OU(z=z, t = i-1, p  = par)^(1+e) - survival.OU(z=z, t= i, p = par)^(1+e)) 
+  }
+  return(sum(units) + 1/(1+r)^n*(survival.OU(z=z, t = n, p  = par)^(1+e)))
+}
+
+#SCR n year endowment
+SCRnye <- function(n, z){
+  nyes(n, z=z) - nye(n, z=z)
+}
+
+#alpha for unisex data and survival function for unisex data, using estimates from separate gender processes
+alpha2 <- function(p, t){
+  mu1 <- p[1] #female
+  s1 <- p[2]
+  mu2 <- p[3] #male
+  s2 <- p[4]
+  g <- p[5] #weight
+  r <- p[6] #correlation
+  
+  ((s2)^2 * g^2 / (4*mu2^3 ) )* ((exp(mu2*t) - 2)^2 + 2*mu2*t - 1) + 
+  ((s1)^2 * (g-1)^2 / (4*mu1^3 ) )* ((exp(mu1*t) - 2)^2 + 2*mu1*t - 1) - 
+  (r * s1 * s2 * g * (g-1)) / (mu1^2 * mu2^2* (mu1 + mu2)) * 
+  (mu2^2*(1-exp(mu1*t)) + mu1^2*(1-exp(mu2 * t)) + 
+  mu1 * mu2 * ((1 - exp(mu2 * t))*(1-exp(mu1*t)) + (mu1 + mu2)*t))
+}
+
+survival.OU.uni <- function(p, t, z1, z2){
+  lambda.f <- - log(1 - z1$qx[1])
+  lambda.m <- - log(1 - z2$qx[1])
+  exp( alpha2(p, t) + (1-p[5]) * beta(p = p[1], t) * lambda.f + p[5]*beta(p = p[3], t)* lambda.m)
+}
+
+graphSurvivalFunctions.OU <- function(z1, z2){
+  obserfemale <- data.frame(f = cbind(tpx(z1), 1:(nrow(z1) - 1)))
+  obsermale <- data.frame(m = cbind(tpx(z2), 1:(nrow(z2) - 1)))
+  obserunisex <- data.frame(u = cbind(tpx(ucohort), 1:(nrow(ucohort) - 1)))
+  obser <- cbind( obserfemale, obsermale, obserunisex)
+  x.grid <- seq(0,to=nrow(z1) - 1,by=0.01)
+  dd <- data.frame(x.grid,female = estimated.density.OU(z1, t = x.grid), male = estimated.density.OU(z2, t = x.grid), 
+                   unisex = survival.OU.uni(p = c(calibration.OU(round(maxlik(z1), digits = 4), z1), calibration.OU(round(maxlik(z2), digits = 4), z2), 0.5, 0.95), t = x.grid, z1 = z1, z2 = z2))
+  
+  library(ggplot2)
+  ggplot(dd) + 
+    geom_line(data=dd,aes(x=x.grid,y=female, colour = "female")) + 
+    geom_line(data=dd,aes(x=x.grid,y=male, colour = "male")) +
+    geom_line(data=dd,aes(x=x.grid,y=unisex, colour = "unisex")) +
+    geom_line(data=obser, aes(x = f.2, y = f.1, colour = "Observed female")) + 
+    geom_line(data=obser, aes(x = m.2, y = m.1, colour = "Observed male")) + 
+    geom_line(data=obser, aes(x = u.2, y = u.1, colour = "Observed unisex")) + 
+    ylab("Survival probability") + xlab("Remaining lifetime") +
+    scale_colour_manual(values=c("red","blue", "black", "yellow", "green", "purple"))
+}
+
+#alpha for unisex data with jump component 
+alpha3 <- function(p, t){
+  mu1 <- p[1] #female
+  s1 <- p[2]
+  mu2 <- p[5] #male
+  s2 <- p[6]
+  g <- p[9] #weight
+  r <- p[10] #correlation
+  eta1 <- p[3] #jump arrival
+  eta2 <- p[7]
+  nu1 <- p[4] #jump size
+  nu2 <- p[8]
+  
+    - ((s2)^2 * g^2 / (4*mu2^3 ) )* ((exp(mu2*t) - 2)^2 + 2*mu2*t - 1) -
+    ((s1)^2 * (g-1)^2 / (4*mu1^3 ) )* ((exp(mu1*t) - 2)^2 + 2*mu1*t - 1) +
+    (r * s1 * s2 * g * (g-1)) / (mu1^2 * mu2^2* (mu1 + mu2)) * 
+    (mu2^2*(1-exp(mu1*t)) + mu1^2*(1-exp(mu2 * t)) + 
+       mu1 * mu2 * ((1 - exp(mu2 * t))*(1-exp(mu1*t)) + (mu1 + mu2)*t)) + 
+     eta1/(mu1 - (1-g)*nu1)*(nu1*(1-g) * t -  log( 1- nu1*(1-g)/(mu1)*(1 - exp(mu1 *t)))) +
+    eta2/(mu2 - g*nu2)*(nu2*(g) * t -  log( 1- nu2*g/(mu2)*(1 - exp(mu2 *t))))
+}
+
+
+survival.OU.uni.jump <- function(p, t, z1, z2){
+  lambda.f <- - log(1 - z1$qx[1])
+  lambda.m <- - log(1 - z2$qx[1])
+  exp( alpha3(p, t) + (1-p[9]) * beta(p = p[1], t) * lambda.f + p[9]*beta(p = p[5], t)* lambda.m)
+}
+
+
+graphSurvivalFunctions.OUj <- function(z1, z2){
+  obserfemale <- data.frame(f = cbind(tpx(z1), 1:(nrow(z1) - 1)))
+  obsermale <- data.frame(m = cbind(tpx(z2), 1:(nrow(z2) - 1)))
+  obserunisex <- data.frame(u = cbind(tpx(ucohort), 1:(nrow(ucohort) - 1)))
+  obser <- cbind( obserfemale, obsermale, obserunisex)
+  x.grid <- seq(0,to=nrow(z1) - 1,by=0.01)
+  dd <- data.frame(x.grid,female = estimated.density.OU.jump(z1, t = x.grid), male = estimated.density.OU.jump(z2, t = x.grid), 
+                   unisex.jump = survival.OU.uni.jump(p = c(calibration.OU.j(z = z1), calibration.OU.j(z = z2), 0.5, 0.95), t = x.grid, z1 = z1, z2 = z2), 
+                   unisex = survival.OU.uni(p = c(calibration.OU(round(maxlik(z1), digits = 4), z1), calibration.OU(round(maxlik(z2), digits = 4), z2), 0.5, 0.95), t = x.grid, z1 = z1, z2 = z2))
+  
+  library(ggplot2)
+  ggplot(dd) + 
+    geom_line(data=dd,aes(x=x.grid,y=female, colour = "female")) + 
+    geom_line(data=dd,aes(x=x.grid,y=male, colour = "male")) +
+    geom_line(data=dd, aes(x = x.grid, y = unisex.jump, colour = "unisex jump"))+
+    geom_line(data=dd, aes(x = x.grid, y = unisex, colour = "unisex OU"))+
+    geom_line(data=obser, aes(x = f.2, y = f.1, colour = "Observed female")) + 
+    geom_line(data=obser, aes(x = m.2, y = m.1, colour = "Observed male")) + 
+    geom_line(data=obser, aes(x = u.2, y = u.1, colour = "Observed unisex")) + 
+    ylab("Survival probability") + xlab("Remaining lifetime") +
+    scale_colour_manual(values=c("red","blue", "black", "yellow", "green", "purple", "orange"))
+}
+
+
+
+differenceNYE <- function(n, z1, z2, gamma){ #calculates the relative difference for uniform SCR and weighted SCR given the data, duration and proportion
+  
+  #Calculates the n-year term endowment for unisex data
+  nye.uni <- function(n , r=0.02, z1, z2, g ){ 
+    units <- rep(NA, n)
+    par <- c(calibration.OU(round(maxlik(z1), digits = 4), z1), calibration.OU(round(maxlik(z2), digits = 4), z2), g, 0.95)
+    for(i in 1:n){
+      units[i] <- 1/(1+r)^(i+1)*
+        (survival.OU.uni(p = par, t = i-1, z1 = z1, z2 = z2)  - 
+           survival.OU.uni(p = par, t = i, z1 = z1, z2 = z2))
+    }
+    return(sum(units) + 1/(1+r)^n*survival.OU.uni(p = par, t = n, z1 = z1, z2 = z2))
+  }
+  
+  #Calculates shocked n-year term endowment for unisex data
+  nyes.uni <- function(n, r=0.02, z1, z2, g, e){
+    units <- rep(NA, n)
+    par <- c(calibration.OU(round(maxlik(z1), digits = 4), z1), calibration.OU(round(maxlik(z2), digits = 4), z2), g, 0.95)
+    for(i in 1:n){
+      units[i] <- 1/(1+r)^(i+1)*
+        (survival.OU.uni(p = par, t = i-1, z1 = z1, z2 = z2)^(1+e)  - 
+           survival.OU.uni(p = par, t = i, z1 = z1, z2 = z2)^(1+e))
+    }
+    return(sum(units) + 1/(1+r)^n*survival.OU.uni(p = par, t = n, z1 = z1, z2 = z2)^(1+e))
+  }
+  
+  #calculates the SCR of the n-year term endowment
+  SCR.nye.u <- function(n, z1, z2, g, e){
+    nyes.uni(n=n, z1 = z1, z2 = z2, g = g, e = e) - nye.uni(n =n, z1 = z1, z2 = z2, g = g)
+  }
+
+  #given the proportion of males in the dataset, calculate g such that premium(unisex) = gamma*male + (1-gamma)*female
+  #gamma <- z2$lx[1]/(z2$lx[1] + z1$lx[1]) proportion of males in dataset
+  gammaNYE <- function(z1, z2, n, g){ #z1 female, z2 male
+    (nye.uni(n, z1 = z1, z2 = z2, g = g) - 
+        (gamma * nye(n, z = z2) + (1-gamma)*nye(n, z = z1)))^2
+  }
+  g <- optimize(gammaNYE, interval = c(0,1), z1 = z1, z2 = z2, n = n)$minimum #g such that unisex premium satisfies actuarial fairness principle
+  
+  #Compute epsilon such that shocked qx = (1+s)qx 
+  shock <- function(epsilon, s, z1, z2){ 
+    par <- c(calibration.OU(round(maxlik(z1), digits = 4), z1), calibration.OU(round(maxlik(z2), digits = 4), z2), g, 0.95)
+    ( 1- survival.OU.uni(par, t =1, z1, z2)^(1+epsilon) - (1 + s)*(1 - survival.OU.uni(par, t=1, z1, z2)))^2 #minimize (1-Sx(1)^(1+e) - (1+s)Qx)^2 wrt e
+  }
+  e.u <- optimize(shock, interval= c(0,1), s = 0.15, z1 = z1, z2 = z2)$minimum
+  
+  return((SCR.nye.u(n= n, z1 = z1, z2 = z2, g = g, e = e.u) - (gamma*SCRnye(n =n, z = z2) + (1-gamma)*(SCRnye(n=n, z =z1))))/(gamma*SCRnye(n =n, z = z2) + (1-gamma)*(SCRnye(n=n, z =z1))))
+}
+```
+
+So far, all relevant functions are defined. Note that alpha3 is the alpha I use in the OU process with jump for the unisex model. Both alpha3 and the survival function can be found in the last 4 functions. 
+Now some graphs we discussed this morning: 
+
+```{r}
+graphSurvivalFunctions.OUj(fcohort, mcohort)
+
+
+```
+I have added the regular OU unisex graph to show that indeed this process is more in the middle than the unisex OU model with jump component. The estimates used in the graph are: 
+```{r}
+calibration.OU(z = fcohort) #regular OU, female parameter estimates (mu, sigma)
+calibration.OU(z = mcohort) #regular OU, male parameter estimates
+calibration.OU.j(z = fcohort) #OU with jump, female estimates including the arrivaltime and size of the jumps respectively (mu, sigma, eta, nu)
+calibration.OU.j(z = mcohort) #OU with jump, female estimates including the arrivaltime and size of the jumps respectively
+```
+Strangely, all estimates are positive and seem to work just fine in the separate processes. This gives me the impression that nothing is wrong with the estimates. That's why I think that the problem must be in the jump component part of alpha3.
+
+Now, for another cohort, the same graph and coefficients: 
+```{r}
+fcohort <- cohort(fdata, 1885, 64, 110)
+mcohort <- cohort(mdata, 1885, 64, 110)
+ucohort <- cohort(udata, 1885, 64, 110)
+graphSurvivalFunctions.OUj(fcohort, mcohort)
+calibration.OU(z = fcohort) #regular OU, female parameter estimates (mu, sigma)
+calibration.OU(z = mcohort) #regular OU, male parameter estimates
+calibration.OU.j(z = fcohort) #OU with jump, female estimates including the arrivaltime and size of the jumps respectively (mu, sigma, eta, nu)
+calibration.OU.j(z = mcohort) #OU with jump, female estimates including the arrivaltime and size of the jumps respectively
+```
+Again, the unisex model with jump is far from in the middle of the separate gender models, whereas the unisex model without jumps works reasonably well. Only in the beginning, the model is underestimating the probabilities, but that is due to a poorer fit of the seperate gender models. 
